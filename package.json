@@ -1,0 +1,36 @@
+{
+  "name": "termo",
+  "version": "1.0.0",
+  "description": "Telegram bot for macOS terminal control - use your Mac terminal from your phone",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx watch src/index.ts",
+    "clean": "rm -rf dist"
+  },
+  "keywords": [
+    "telegram",
+    "terminal",
+    "macos",
+    "bot",
+    "cli"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "better-sqlite3": "^11.7.0",
+    "dotenv": "^16.4.7",
+    "grammy": "^1.21.1",
+    "strip-ansi": "^7.1.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/node": "^22.10.5",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
