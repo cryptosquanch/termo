@@ -1,4 +1,4 @@
-import { Bot, Context } from 'grammy';
+import { Bot, Context, InlineKeyboard } from 'grammy';
 import { randomBytes } from 'crypto';
 import { Config } from '../config.js';
 import { TerminalExecutor } from '../terminal/executor.js';
@@ -15,6 +15,7 @@ import {
   validateCommand,
   isInteractiveCommand,
   getInteractiveWarning,
+  validateFilePath,
 } from '../terminal/sanitizer.js';
 import { formatOutput, formatDuration, shortenPath } from '../terminal/output-handler.js';
 import { addHistoryEntry, getRecentHistory } from '../storage/history.js';
@@ -32,6 +33,8 @@ import {
   getSmartRepliesKeyboard,
   getClaudeThinkingKeyboard,
   getClaudeDoneKeyboard,
+  getClaudeDoneWithProjectsKeyboard,
+  getQuickProjectsBar,
   getMainMenuKeyboard,
   getContextWarningKeyboard,
   getBookmarksKeyboard,
@@ -50,6 +53,12 @@ import {
   getUsageSummary,
   formatTokenCount,
   formatCost,
+  updateContextFromScreen,
+  resetContext,
+  getContextState,
+  formatContextReport,
+  formatContextCompact,
+  getContextWarning,
 } from '../storage/usage.js';
 import { addPin, removePin, getPins, getPin } from '../storage/pins.js';
 import { searchHistory } from '../storage/history.js';
@@ -62,6 +71,13 @@ import {
   capturePane,
   capturePaneSinceLast,
   clearScrollback,
+  listTmuxSessions,
+  getUserTmuxSession,
+  setUserTmuxSession,
+  clearUserTmuxSession,
+  isUserInTmuxMode,
+  killTmuxSession,
+  getTmuxCwd,
 } from '../terminal/tmux-bridge.js';
 import { sendSafe, sendAsFile, editSafe, parseClaudeStatus } from './safe-sender.js';
 import { copyToClipboard, notifyTaskComplete, transcribeAudio, isWhisperAvailable } from '../utils/system.js';
@@ -79,8 +95,6 @@ const MIN_CHANGE_LINES = 2; // Only update if at least 2 lines changed
 
 // Track active session per user
 const userActiveSessions = new Map<number, string>();
-// Track tmux mode per user
-const userTmuxMode = new Map<number, boolean>();
 // Track last screen content for detecting changes
 const userLastScreen = new Map<number, string>();
 // Track active auto-refresh timers
@@ -102,7 +116,7 @@ function cleanupStaleUsers(): void {
   const now = Date.now();
   for (const [userId, lastActive] of userLastActivity) {
     if (now - lastActive > MAX_INACTIVE_TIME) {
-      userTmuxMode.delete(userId);
+      clearUserTmuxSession(userId);  // Clear tmux session tracking
       userLastScreen.delete(userId);
       userLastCommand.delete(userId);
       userLastActivity.delete(userId);
@@ -130,12 +144,22 @@ function setActiveSessionName(userId: number, name: string): void {
   userActiveSessions.set(userId, name);
 }
 
+// Use tmux-bridge for tmux mode tracking
 function isInTmuxMode(userId: number): boolean {
-  return userTmuxMode.get(userId) || false;
+  return isUserInTmuxMode(userId);
 }
 
-function setTmuxMode(userId: number, enabled: boolean): void {
-  userTmuxMode.set(userId, enabled);
+function setTmuxMode(userId: number, enabled: boolean, sessionName?: string): void {
+  if (enabled && sessionName) {
+    setUserTmuxSession(userId, sessionName);
+  } else if (!enabled) {
+    clearUserTmuxSession(userId);
+  }
+}
+
+// Get current user's tmux session name
+function getCurrentTmuxSession(userId: number): string | null {
+  return getUserTmuxSession(userId);
 }
 
 function stopAutoRefresh(userId: number): void {
@@ -156,6 +180,13 @@ async function startAutoRefresh(
 ): Promise<void> {
   // Stop any existing auto-refresh for this user
   stopAutoRefresh(userId);
+
+  // Get user's current tmux session
+  const tmuxSession = getCurrentTmuxSession(userId);
+  if (!tmuxSession) {
+    console.error(`[AutoRefresh] No tmux session for user ${userId}`);
+    return;
+  }
 
   let lastScreen = initialScreen;
   const messageToFind = userMessage || '';  // Find this to isolate response
@@ -190,7 +221,7 @@ async function startAutoRefresh(
         stopAutoRefresh(userId);
         // Send timeout notification with current screen
         if (!notifiedComplete) {
-          const timeoutScreen = await capturePane();
+          const timeoutScreen = await capturePane(tmuxSession);
           await bot.api.sendMessage(
             chatId,
             '⏰ *Auto-refresh stopped* (10 min timeout)\n\n```\n' + (timeoutScreen || '(empty)') + '\n```',
@@ -207,7 +238,7 @@ async function startAutoRefresh(
       }
 
       // Capture current screen
-      const currentScreen = await capturePane();
+      const currentScreen = await capturePane(tmuxSession);
 
       // Check if screen changed significantly
       const lastLines = lastScreen.split('\n');
@@ -376,24 +407,16 @@ async function startAutoRefresh(
         // Clean up terminal UI noise
         responseContent = cleanTerminalOutput(responseContent);
 
+        // Update context meter from screen output
+        updateContextFromScreen(userId, currentScreen);
+
         // Check for context-low warning and notify user
-        const contextLowPatterns = [
-          /context.*?(\d+)%/i,
-          /(\d+)%.*context/i,
-          /running low on context/i,
-          /context is getting low/i,
-        ];
+        const contextState = getContextState(userId);
         let contextWarning = '';
-        for (const pattern of contextLowPatterns) {
-          const match = currentScreen.match(pattern);
-          if (match) {
-            const percent = match[1] ? parseInt(match[1]) : null;
-            if (percent && percent < 30) {
-              contextWarning = `\n\n⚠️ *Context low (${percent}%)* - Consider /reset`;
-            } else if (!percent) {
-              contextWarning = '\n\n⚠️ *Context running low* - Consider /reset';
-            }
-            break;
+        if (contextState) {
+          const warning = getContextWarning(contextState.percentage);
+          if (warning) {
+            contextWarning = '\n\n' + warning;
           }
         }
 
@@ -404,13 +427,17 @@ async function startAutoRefresh(
         if (chunks.length === 1 && lastMessageId && !hasShownFirstScreen) {
           // Short output - edit existing message
           try {
+            // Get pins for quick project switcher
+            const pins = getPins(userId);
+            const currentProject = getCurrentProject(userId) ?? undefined;
+
             await bot.api.editMessageText(
               chatId,
               lastMessageId,
               '✅ *Done!*\n\n```\n' + chunks[0] + '\n```',
               {
                 parse_mode: 'Markdown',
-                reply_markup: getClaudeDoneKeyboard(currentScreen),
+                reply_markup: getClaudeDoneWithProjectsKeyboard(currentScreen, pins, currentProject),
               }
             );
             hasShownFirstScreen = true;
@@ -428,6 +455,10 @@ async function startAutoRefresh(
 
         await bot.api.sendMessage(chatId, '✅ *Done!*', { parse_mode: 'Markdown' });
 
+        // Get pins for quick project switcher
+        const pins = getPins(userId);
+        const currentProject = getCurrentProject(userId) ?? undefined;
+
         for (let i = 0; i < chunks.length; i++) {
           const isLast = i === chunks.length - 1;
           await bot.api.sendMessage(
@@ -435,7 +466,7 @@ async function startAutoRefresh(
             '```\n' + chunks[i] + '\n```' + (chunks.length > 1 ? ` _(${i + 1}/${chunks.length})_` : ''),
             {
               parse_mode: 'Markdown',
-              ...(isLast ? { reply_markup: getClaudeDoneKeyboard(currentScreen) } : {}),
+              ...(isLast ? { reply_markup: getClaudeDoneWithProjectsKeyboard(currentScreen, pins, currentProject) } : {}),
             }
           );
         }
@@ -613,30 +644,72 @@ export function setupBot(
   });
 
   // /attach command - Claude Mode (interactive Claude Code session)
+  // Usage: /attach [session-name]  - attach to specific session
+  //        /attach                 - show session picker or attach to default
   bot.command('attach', async (ctx) => {
     const userId = ctx.from!.id;
+    const args = ctx.message!.text!.split(' ').slice(1);
+    const requestedSession = args[0]?.trim();
 
-    // Check if tmux session exists, create if not
-    const isActive = await isTmuxSessionActive();
+    // If already attached, show current session
+    const currentSession = getCurrentTmuxSession(userId);
+    if (currentSession && !requestedSession) {
+      await ctx.reply(
+        `Already attached to \`${currentSession}\`\n\nUse /detach first, or /attach <name> to switch.`,
+        { parse_mode: 'Markdown' }
+      );
+      return;
+    }
+
+    // List available sessions
+    const sessions = await listTmuxSessions();
+
+    // If no session specified, show picker (if multiple sessions exist)
+    if (!requestedSession && sessions.length > 1) {
+      const keyboard = new InlineKeyboard();
+      sessions.forEach((s, i) => {
+        const icon = s.attached ? '🟢' : '⚪';
+        keyboard.text(`${icon} ${s.name}`, `tmux:attach:${s.name}`);
+        if (i % 2 === 1) keyboard.row();
+      });
+      keyboard.row().text('➕ New Session', 'tmux:new');
+
+      await ctx.reply(
+        '*📺 Select Tmux Session*\n\n' +
+        sessions.map(s => {
+          const icon = s.attached ? '🟢' : '⚪';
+          return `${icon} \`${s.name}\` (${s.windows} window${s.windows > 1 ? 's' : ''})`;
+        }).join('\n'),
+        { parse_mode: 'Markdown', reply_markup: keyboard }
+      );
+      return;
+    }
+
+    // Determine session name to attach to
+    const sessionName = requestedSession || (sessions.length > 0 ? sessions[0].name : 'termo-main');
+
+    // Check if session exists, create if not
+    const isActive = await isTmuxSessionActive(sessionName);
     if (!isActive) {
-      await ctx.reply('Creating tmux session...');
-      const created = await createTmuxSession();
+      await ctx.reply(`Creating tmux session \`${sessionName}\`...`, { parse_mode: 'Markdown' });
+      const created = await createTmuxSession(sessionName);
       if (!created) {
-        await ctx.reply('Failed to create tmux session.');
+        await ctx.reply(`Failed to create tmux session \`${sessionName}\`.`, { parse_mode: 'Markdown' });
         return;
       }
     }
 
-    setTmuxMode(userId, true);
+    // Attach to the session
+    setTmuxMode(userId, true, sessionName);
 
     // Clear old scrollback to start fresh
-    await clearScrollback();
+    await clearScrollback(sessionName);
 
-    // Get initial screen (truncate to fit Telegram's limit)
-    let screen = await capturePane();
+    // Get initial screen
+    let screen = await capturePane(sessionName);
     userLastScreen.set(userId, screen);
 
-    // Truncate screen to last ~30 lines to leave room for welcome message
+    // Truncate screen to last ~30 lines
     const lines = screen.split('\n');
     if (lines.length > 30) {
       screen = '...\n' + lines.slice(-30).join('\n');
@@ -645,9 +718,12 @@ export function setupBot(
       screen = screen.slice(-2000);
     }
 
+    // Get cwd for context
+    const cwd = await getTmuxCwd(sessionName);
+
     await ctx.reply(
-      '🟢 *Claude Mode Active*\n\n' +
-      'Type messages to chat with Claude Code.\n\n' +
+      `🟢 *Claude Mode Active* (\`${sessionName}\`)\n` +
+      (cwd ? `📁 ${cwd}\n\n` : '\n') +
       '*Quick tips:*\n' +
       '• Send screenshots - OCR extracts text\n' +
       '• Type `ultrathink` for deep thinking\n' +
@@ -664,7 +740,8 @@ export function setupBot(
   bot.command('detach', async (ctx) => {
     const userId = ctx.from!.id;
 
-    if (!isInTmuxMode(userId)) {
+    const currentSession = getCurrentTmuxSession(userId);
+    if (!currentSession) {
       await ctx.reply('Not in Claude Mode. Use /attach to enter.');
       return;
     }
@@ -672,23 +749,134 @@ export function setupBot(
     stopAutoRefresh(userId);
     setTmuxMode(userId, false);
     await ctx.reply(
-      '👋 Exited Claude Mode.\n\n' +
+      `👋 Detached from \`${currentSession}\`\n\n` +
       'Back to normal mode - commands run and return results.\n' +
       'Use /attach to re-enter Claude Mode.',
-      { reply_markup: getQuickActionsKeyboard() }
+      { parse_mode: 'Markdown', reply_markup: getQuickActionsKeyboard() }
+    );
+  });
+
+  // /tmux command - Manage tmux sessions
+  bot.command('tmux', async (ctx) => {
+    const userId = ctx.from!.id;
+    const args = ctx.message!.text!.split(' ').slice(1);
+    const subcommand = args[0]?.toLowerCase();
+    const sessionArg = args[1]?.trim();
+
+    // List sessions (default)
+    if (!subcommand || subcommand === 'list' || subcommand === 'ls') {
+      const sessions = await listTmuxSessions();
+      const currentSession = getCurrentTmuxSession(userId);
+
+      if (sessions.length === 0) {
+        await ctx.reply(
+          '*No tmux sessions*\n\nUse /attach to create one, or:\n`/tmux new <name>` to create a named session',
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
+
+      const keyboard = new InlineKeyboard();
+      sessions.forEach((s, i) => {
+        const isCurrent = s.name === currentSession;
+        const icon = isCurrent ? '📺' : s.attached ? '🟢' : '⚪';
+        keyboard.text(`${icon} ${s.name}`, `tmux:attach:${s.name}`);
+        if (i % 2 === 1) keyboard.row();
+      });
+      if (sessions.length % 2 === 1) keyboard.row();
+      keyboard.text('➕ New', 'tmux:new').text('🗑️ Kill', 'tmux:kill_menu');
+
+      await ctx.reply(
+        '*📺 Tmux Sessions*\n\n' +
+        sessions.map(s => {
+          const isCurrent = s.name === currentSession;
+          const icon = isCurrent ? '📺' : s.attached ? '🟢' : '⚪';
+          const marker = isCurrent ? ' ← *you*' : '';
+          return `${icon} \`${s.name}\`${marker}\n   Created: ${s.created}`;
+        }).join('\n\n'),
+        { parse_mode: 'Markdown', reply_markup: keyboard }
+      );
+      return;
+    }
+
+    // Create new session
+    if (subcommand === 'new' || subcommand === 'create') {
+      if (!sessionArg) {
+        await ctx.reply('Usage: `/tmux new <name>`\n\nExample: `/tmux new work`', { parse_mode: 'Markdown' });
+        return;
+      }
+
+      // Validate name
+      if (!/^[a-zA-Z0-9_-]+$/.test(sessionArg)) {
+        await ctx.reply('Session name can only contain letters, numbers, dash, and underscore.');
+        return;
+      }
+
+      const exists = await isTmuxSessionActive(sessionArg);
+      if (exists) {
+        await ctx.reply(`Session \`${sessionArg}\` already exists. Use /attach ${sessionArg} to connect.`, { parse_mode: 'Markdown' });
+        return;
+      }
+
+      const created = await createTmuxSession(sessionArg);
+      if (created) {
+        await ctx.reply(
+          `✅ Created session \`${sessionArg}\`\n\nUse /attach ${sessionArg} to connect.`,
+          { parse_mode: 'Markdown' }
+        );
+      } else {
+        await ctx.reply(`❌ Failed to create session \`${sessionArg}\``, { parse_mode: 'Markdown' });
+      }
+      return;
+    }
+
+    // Kill session
+    if (subcommand === 'kill' || subcommand === 'rm' || subcommand === 'delete') {
+      if (!sessionArg) {
+        await ctx.reply('Usage: `/tmux kill <name>`\n\nExample: `/tmux kill work`', { parse_mode: 'Markdown' });
+        return;
+      }
+
+      const exists = await isTmuxSessionActive(sessionArg);
+      if (!exists) {
+        await ctx.reply(`Session \`${sessionArg}\` doesn't exist.`, { parse_mode: 'Markdown' });
+        return;
+      }
+
+      // If user is attached to this session, detach first
+      const currentSession = getCurrentTmuxSession(userId);
+      if (currentSession === sessionArg) {
+        stopAutoRefresh(userId);
+        setTmuxMode(userId, false);
+      }
+
+      await killTmuxSession(sessionArg);
+      await ctx.reply(`🗑️ Killed session \`${sessionArg}\``, { parse_mode: 'Markdown' });
+      return;
+    }
+
+    // Unknown subcommand
+    await ctx.reply(
+      '*Tmux Commands*\n\n' +
+      '`/tmux` - List sessions\n' +
+      '`/tmux new <name>` - Create session\n' +
+      '`/tmux kill <name>` - Kill session\n' +
+      '`/attach <name>` - Attach to session',
+      { parse_mode: 'Markdown' }
     );
   });
 
   // /screen command - Show tmux screen
   bot.command('screen', async (ctx) => {
     const userId = ctx.from!.id;
+    const session = getCurrentTmuxSession(userId);
 
-    if (!isInTmuxMode(userId)) {
+    if (!session) {
       await ctx.reply('Not in Claude Mode. Use /attach first.');
       return;
     }
 
-    let screen = await capturePane();
+    let screen = await capturePane(session);
 
     // Truncate to avoid message too long
     if (screen.length > 3000) {
@@ -704,17 +892,18 @@ export function setupBot(
   // /ctrlc command - Send Ctrl+C
   bot.command('ctrlc', async (ctx) => {
     const userId = ctx.from!.id;
+    const session = getCurrentTmuxSession(userId);
 
-    if (!isInTmuxMode(userId)) {
+    if (!session) {
       await ctx.reply('Not in Claude Mode.');
       return;
     }
 
-    await sendCtrlC();
+    await sendCtrlC(session);
     await ctx.reply('Sent Ctrl+C');
 
     // Show updated screen
-    const screen = await capturePane();
+    const screen = await capturePane(session);
     await ctx.reply(
       '```\n' + (screen || '(empty)') + '\n```',
       { parse_mode: 'Markdown' }
@@ -730,16 +919,22 @@ export function setupBot(
       return;
     }
 
+    const session = getCurrentTmuxSession(userId);
+    if (!session) {
+      await ctx.reply('Not attached to any session. Use /attach first.');
+      return;
+    }
+
     await ctx.reply('🔄 Sending /clear to Claude Code...');
 
     // Send /clear to reset Claude's context
-    await sendToTmux('/clear');
-    await sendEnterToTmux();
+    await sendToTmux('/clear', session);
+    await sendEnterToTmux(session);
 
     // Wait a moment for Claude to process
     await new Promise(resolve => setTimeout(resolve, 3000));
 
-    let screen = await capturePane();
+    let screen = await capturePane(session);
 
     // Truncate to avoid "message too long" error
     const lines = screen.split('\n');
@@ -766,7 +961,13 @@ export function setupBot(
       return;
     }
 
-    const screen = await capturePane();
+    const session = getCurrentTmuxSession(userId);
+    if (!session) {
+      await ctx.reply('Not attached to any session. Use /attach first.');
+      return;
+    }
+
+    const screen = await capturePane(session);
     if (!screen || screen.trim() === '') {
       await ctx.reply('Screen is empty.');
       return;
@@ -784,7 +985,13 @@ export function setupBot(
       return;
     }
 
-    const screen = await capturePane();
+    const session = getCurrentTmuxSession(userId);
+    if (!session) {
+      await ctx.reply('Not attached to any session. Use /attach first.');
+      return;
+    }
+
+    const screen = await capturePane(session);
     const { isThinking, isReady, isDone, status } = parseClaudeStatus(screen);
 
     const statusEmoji = isThinking ? '🔄' : isDone ? '✅' : isReady ? '💬' : '❓';
@@ -921,8 +1128,13 @@ export function setupBot(
 
     // If in tmux mode, send Ctrl+C
     if (isInTmuxMode(userId)) {
-      await sendCtrlC();
-      await ctx.reply('Sent Ctrl+C to tmux session');
+      const session = getCurrentTmuxSession(userId);
+      if (session) {
+        await sendCtrlC(session);
+        await ctx.reply(`Sent Ctrl+C to tmux session '${session}'`);
+      } else {
+        await ctx.reply('Not attached to any tmux session.');
+      }
       return;
     }
 
@@ -1140,6 +1352,21 @@ export function setupBot(
     );
   });
 
+  // /context command - Show context meter
+  bot.command('context', async (ctx) => {
+    const userId = ctx.from!.id;
+    const report = formatContextReport(userId);
+
+    await ctx.reply(report, {
+      parse_mode: 'Markdown',
+      reply_markup: new InlineKeyboard()
+        .text('🔄 Refresh', 'action:context_refresh')
+        .text('🗑️ Reset', 'action:reset')
+        .row()
+        .text('◀️ Back', 'action:menu'),
+    });
+  });
+
   // /export command - Export conversation as markdown
   bot.command('export', async (ctx) => {
     const userId = ctx.from!.id;
@@ -1149,7 +1376,13 @@ export function setupBot(
       return;
     }
 
-    const screen = await capturePane();
+    const session = getCurrentTmuxSession(userId);
+    if (!session) {
+      await ctx.reply('Not attached to any session. Use /attach first.');
+      return;
+    }
+
+    const screen = await capturePane(session);
     if (!screen || screen.trim() === '') {
       await ctx.reply('Nothing to export.');
       return;
@@ -1163,6 +1396,134 @@ export function setupBot(
       `\`\`\`\n${screen}\n\`\`\`\n`;
 
     await sendAsFile(ctx, markdown, `claude-export-${timestamp}.md`);
+  });
+
+  // /view command - View file with syntax highlighting
+  bot.command('view', async (ctx) => {
+    const userId = ctx.from!.id;
+    const filepath = ctx.match?.trim();
+
+    if (!filepath) {
+      await ctx.reply(
+        '*View a file*\n\n' +
+        'Usage: `/view <filepath>`\n\n' +
+        'Examples:\n' +
+        '`/view src/index.ts`\n' +
+        '`/view package.json`\n' +
+        '`/view README.md`',
+        { parse_mode: 'Markdown' }
+      );
+      return;
+    }
+
+    // Detect language from extension for syntax highlighting
+    const ext = filepath.split('.').pop()?.toLowerCase() || '';
+    const langMap: Record<string, string> = {
+      ts: 'typescript', tsx: 'typescript', js: 'javascript', jsx: 'javascript',
+      py: 'python', rb: 'ruby', rs: 'rust', go: 'go', java: 'java',
+      cpp: 'cpp', c: 'c', h: 'c', hpp: 'cpp', cs: 'csharp',
+      json: 'json', yaml: 'yaml', yml: 'yaml', toml: 'toml',
+      md: 'markdown', html: 'html', css: 'css', scss: 'scss',
+      sh: 'bash', bash: 'bash', zsh: 'bash', fish: 'fish',
+      sql: 'sql', graphql: 'graphql', prisma: 'prisma',
+      dockerfile: 'dockerfile', makefile: 'makefile',
+    };
+    const lang = langMap[ext] || '';
+
+    if (isInTmuxMode(userId)) {
+      // In Claude mode - use cat command via tmux
+      const session = getCurrentTmuxSession(userId);
+      if (!session) {
+        await ctx.reply('Not attached to any session. Use /attach first.');
+        return;
+      }
+      const safeFilepath = filepath.replace(/'/g, "'\\''");
+      await sendToTmux(`cat '${safeFilepath}'`, session);
+      await sendEnterToTmux(session);
+      await new Promise(r => setTimeout(r, 500));
+
+      const screen = await capturePane(session);
+      const lines = screen.split('\n');
+
+      // Find the cat output (between command and next prompt)
+      let startIdx = lines.findIndex(l => l.includes(`cat '${safeFilepath}'`) || l.includes(`cat ${filepath}`));
+      if (startIdx === -1) startIdx = 0;
+      else startIdx++;
+
+      let endIdx = lines.length;
+      for (let i = startIdx; i < lines.length; i++) {
+        const t = lines[i].trim();
+        if (t === '>' || t.startsWith('> ') || t.includes('No such file')) {
+          endIdx = i;
+          break;
+        }
+      }
+
+      const content = lines.slice(startIdx, endIdx).join('\n').trim();
+
+      if (!content || content.includes('No such file')) {
+        await ctx.reply(`❌ File not found: \`${filepath}\``, { parse_mode: 'Markdown' });
+        return;
+      }
+
+      // Truncate if too long
+      const maxLines = 50;
+      const contentLines = content.split('\n');
+      const truncated = contentLines.length > maxLines;
+      const displayContent = truncated
+        ? contentLines.slice(0, maxLines).join('\n') + `\n\n... (${contentLines.length - maxLines} more lines)`
+        : content;
+
+      const filename = filepath.split('/').pop() || filepath;
+      await ctx.reply(
+        `📄 *${filename}*${truncated ? ` _(showing ${maxLines}/${contentLines.length} lines)_` : ''}\n\n` +
+        `\`\`\`${lang}\n${displayContent}\n\`\`\``,
+        {
+          parse_mode: 'Markdown',
+          reply_markup: new InlineKeyboard()
+            .text('📄 Full file', `viewfull:${filepath}`)
+            .text('📋 Copy path', `copypath:${filepath}`),
+        }
+      );
+    } else {
+      // Not in Claude mode - use session's cwd
+      const sessionName = getActiveSessionName(userId);
+      const session = getActiveSession(userId, sessionName);
+      const cwd = session?.cwd || process.cwd();
+
+      // Read file directly
+      const fullPath = filepath.startsWith('/') ? filepath : `${cwd}/${filepath}`;
+
+      try {
+        const { readFileSync, existsSync } = await import('fs');
+        if (!existsSync(fullPath)) {
+          await ctx.reply(`❌ File not found: \`${filepath}\``, { parse_mode: 'Markdown' });
+          return;
+        }
+
+        const content = readFileSync(fullPath, 'utf-8');
+        const contentLines = content.split('\n');
+        const maxLines = 50;
+        const truncated = contentLines.length > maxLines;
+        const displayContent = truncated
+          ? contentLines.slice(0, maxLines).join('\n') + `\n\n... (${contentLines.length - maxLines} more lines)`
+          : content;
+
+        const filename = filepath.split('/').pop() || filepath;
+        await ctx.reply(
+          `📄 *${filename}*${truncated ? ` _(showing ${maxLines}/${contentLines.length} lines)_` : ''}\n\n` +
+          `\`\`\`${lang}\n${displayContent}\n\`\`\``,
+          {
+            parse_mode: 'Markdown',
+            reply_markup: new InlineKeyboard()
+              .text('📄 Full file', `viewfull:${filepath}`)
+              .text('📋 Copy path', `copypath:${filepath}`),
+          }
+        );
+      } catch (error) {
+        await ctx.reply(`❌ Error reading file: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      }
+    }
   });
 
   // /voice command - Toggle voice output for Claude responses
@@ -1374,11 +1735,16 @@ export function setupBot(
 
       // If in tmux mode, send to tmux
       if (isInTmuxMode(userId)) {
+        const session = getCurrentTmuxSession(userId);
+        if (!session) {
+          await ctx.reply('Not attached to any session.');
+          return;
+        }
         stopAutoRefresh(userId);
-        await sendToTmux(command);
-        await sendEnterToTmux();
+        await sendToTmux(command, session);
+        await sendEnterToTmux(session);
         await new Promise(r => setTimeout(r, 800));
-        const screen = await capturePane();
+        const screen = await capturePane(session);
         await ctx.reply('```\n' + (screen || '(empty)') + '\n```', { parse_mode: 'Markdown' });
         userLastScreen.set(userId, screen);
         startAutoRefresh(userId, ctx.chat!.id, bot, screen);
@@ -1479,8 +1845,13 @@ export function setupBot(
 
         case 'kill': {
           if (isInTmuxMode(userId)) {
-            await sendCtrlC();
-            await ctx.editMessageText('Sent Ctrl+C');
+            const tmuxSession = getCurrentTmuxSession(userId);
+            if (tmuxSession) {
+              await sendCtrlC(tmuxSession);
+              await ctx.editMessageText(`Sent Ctrl+C to '${tmuxSession}'`);
+            } else {
+              await ctx.editMessageText('Not attached to any tmux session.');
+            }
             return;
           }
           const sessionName = getActiveSessionName(userId);
@@ -1519,7 +1890,12 @@ export function setupBot(
           break;
 
         case 'screen': {
-          const screen = await capturePane();
+          const tmuxSession = getCurrentTmuxSession(userId);
+          if (!tmuxSession) {
+            await ctx.editMessageText('Not attached to any session.');
+            break;
+          }
+          const screen = await capturePane(tmuxSession);
           await ctx.editMessageText(
             '```\n' + (screen || '(empty)') + '\n```',
             { parse_mode: 'Markdown' }
@@ -1527,8 +1903,13 @@ export function setupBot(
           break;
         }
 
-        case 'ctrlc':
-          await sendCtrlC();
+        case 'ctrlc': {
+          const tmuxSession = getCurrentTmuxSession(userId);
+          if (!tmuxSession) {
+            await ctx.editMessageText('Not attached to any session.');
+            break;
+          }
+          await sendCtrlC(tmuxSession);
           // Stop any auto-refresh
           stopAutoRefresh(userId);
           try {
@@ -1538,12 +1919,13 @@ export function setupBot(
             await ctx.reply('⏹️ Sent Ctrl+C');
           }
           // Show current screen
-          const ctrlcScreen = await capturePane();
+          const ctrlcScreen = await capturePane(tmuxSession);
           await bot.api.sendMessage(ctx.chat!.id,
             '```\n' + (ctrlcScreen || '(empty)') + '\n```',
             { parse_mode: 'Markdown' }
           );
           break;
+        }
 
         case 'pin_current':
         case 'pin_prompt':
@@ -1554,50 +1936,58 @@ export function setupBot(
           break;
 
         case 'attach': {
-          // Attach to Claude Mode via button
-          const isActive = await isTmuxSessionActive();
-          if (!isActive) {
-            await ctx.editMessageText('Creating tmux session...');
-            const created = await createTmuxSession();
-            if (!created) {
-              await ctx.editMessageText('Failed to create tmux session.');
-              return;
-            }
+          // Show session picker via button
+          const sessions = await listTmuxSessions();
+          if (sessions.length === 0) {
+            await ctx.editMessageText(
+              '*No tmux sessions*\n\n' +
+              'Create one with `/attach <name>` or use `/tmux new <name>`',
+              { parse_mode: 'Markdown' }
+            );
+          } else {
+            const keyboard = new InlineKeyboard();
+            sessions.forEach((s) => {
+              const marker = s.attached ? ' 🟢' : '';
+              keyboard.text(`${s.name}${marker}`, `tmux:attach:${s.name}`).row();
+            });
+            keyboard.text('+ New Session', 'tmux:new').row();
+            keyboard.text('◀️ Back', 'action:menu');
+            await ctx.editMessageText(
+              '*📺 Tmux Sessions*\n_Tap to attach_',
+              { parse_mode: 'Markdown', reply_markup: keyboard }
+            );
           }
-          setTmuxMode(userId, true);
-          await clearScrollback();
-          let attachScreen = await capturePane();
-          if (attachScreen.length > 2000) {
-            attachScreen = attachScreen.slice(-2000);
-          }
-          await ctx.editMessageText(
-            '✅ *Attached to Claude Code*\n\n' +
-            '`/screen` refresh │ `/ctrlc` cancel │ `/detach` exit\n\n' +
-            '```\n' + (attachScreen || '(empty)') + '\n```',
-            { parse_mode: 'Markdown' }
-          );
           break;
         }
 
-        case 'detach':
+        case 'detach': {
+          const currentSession = getCurrentTmuxSession(userId);
           stopAutoRefresh(userId);
           setTmuxMode(userId, false);
           await ctx.editMessageText(
-            '👋 Exited Claude Mode.\n\nBack to normal mode.',
+            `👋 Detached from '${currentSession || 'session'}'.\n\nBack to normal mode.`,
             { reply_markup: getMainMenuKeyboard(false) }
           );
           break;
+        }
 
         case 'reset': {
           if (!isInTmuxMode(userId)) {
             await ctx.reply('Not in Claude Mode. Use /attach first.');
             return;
           }
+          const tmuxSession = getCurrentTmuxSession(userId);
+          if (!tmuxSession) {
+            await ctx.reply('Not attached to any session.');
+            return;
+          }
           await ctx.editMessageText('🔄 Resetting Claude context...');
-          await sendToTmux('/clear');
-          await sendEnterToTmux();
+          await sendToTmux('/clear', tmuxSession);
+          await sendEnterToTmux(tmuxSession);
           await new Promise(resolve => setTimeout(resolve, 3000));
-          let resetScreen = await capturePane();
+          // Reset context meter
+          resetContext(userId);
+          let resetScreen = await capturePane(tmuxSession);
           if (resetScreen.length > 2000) {
             resetScreen = resetScreen.slice(-2000);
           }
@@ -1608,12 +1998,30 @@ export function setupBot(
           break;
         }
 
+        case 'context_refresh': {
+          const report = formatContextReport(userId);
+          await ctx.editMessageText(report, {
+            parse_mode: 'Markdown',
+            reply_markup: new InlineKeyboard()
+              .text('🔄 Refresh', 'action:context_refresh')
+              .text('🗑️ Reset', 'action:reset')
+              .row()
+              .text('◀️ Back', 'action:menu'),
+          });
+          break;
+        }
+
         case 'full': {
           if (!isInTmuxMode(userId)) {
             await ctx.reply('Not in Claude Mode. Use /attach first.');
             return;
           }
-          const fullScreen = await capturePane();
+          const tmuxSession = getCurrentTmuxSession(userId);
+          if (!tmuxSession) {
+            await ctx.reply('Not attached to any session.');
+            return;
+          }
+          const fullScreen = await capturePane(tmuxSession);
           if (!fullScreen || fullScreen.trim() === '') {
             await ctx.reply('Screen is empty.');
             return;
@@ -1627,7 +2035,12 @@ export function setupBot(
             await ctx.answerCallbackQuery({ text: 'Not in Claude Mode' });
             return;
           }
-          const copyScreen = await capturePane();
+          const tmuxSession = getCurrentTmuxSession(userId);
+          if (!tmuxSession) {
+            await ctx.answerCallbackQuery({ text: 'Not attached to any session' });
+            return;
+          }
+          const copyScreen = await capturePane(tmuxSession);
           if (!copyScreen || copyScreen.trim() === '') {
             await ctx.answerCallbackQuery({ text: 'Nothing to copy' });
             return;
@@ -1646,7 +2059,12 @@ export function setupBot(
             await ctx.answerCallbackQuery({ text: 'Not in Claude Mode' });
             return;
           }
-          const bookmarkScreen = await capturePane();
+          const tmuxSession = getCurrentTmuxSession(userId);
+          if (!tmuxSession) {
+            await ctx.answerCallbackQuery({ text: 'Not attached to any session' });
+            return;
+          }
+          const bookmarkScreen = await capturePane(tmuxSession);
           if (!bookmarkScreen || bookmarkScreen.trim() === '') {
             await ctx.answerCallbackQuery({ text: 'Nothing to bookmark' });
             return;
@@ -1770,6 +2188,12 @@ export function setupBot(
           return;
       }
 
+      const tmuxSession = getCurrentTmuxSession(userId);
+      if (!tmuxSession) {
+        await ctx.reply('Not attached to any session.');
+        return;
+      }
+
       // Show thinking indicator
       const thinkingMsg = await ctx.reply(thinkingText, {
         parse_mode: 'Markdown',
@@ -1778,12 +2202,12 @@ export function setupBot(
 
       // Send to tmux (or just Enter for continue)
       if (response) {
-        await sendToTmux(response);
+        await sendToTmux(response, tmuxSession);
       }
-      await sendEnterToTmux();
+      await sendEnterToTmux(tmuxSession);
       await new Promise(r => setTimeout(r, 500));
 
-      const screen = await capturePane();
+      const screen = await capturePane(tmuxSession);
       userLastScreen.set(userId, screen);
       startAutoRefresh(userId, ctx.chat!.id, bot, screen, thinkingMsg.message_id, response || '');
       return;
@@ -1866,10 +2290,209 @@ export function setupBot(
       return;
     }
 
+    // Handle file viewer actions (viewfull, copypath)
+    if (data.startsWith('viewfull:')) {
+      const filepath = data.slice(9);
+
+      // Validate file path for security
+      const pathValidation = validateFilePath(filepath);
+      if (!pathValidation.allowed) {
+        await ctx.answerCallbackQuery({
+          text: `🚫 ${pathValidation.reason}`,
+          show_alert: true,
+        });
+        return;
+      }
+
+      try {
+        // Direct file read - path already validated
+        const fs = await import('fs/promises');
+        const content = await fs.readFile(pathValidation.resolvedPath!, 'utf-8');
+
+        // Detect language for syntax highlighting
+        const ext = filepath.split('.').pop()?.toLowerCase() || '';
+        const langMap: Record<string, string> = {
+          ts: 'typescript', tsx: 'typescript', js: 'javascript', jsx: 'javascript',
+          py: 'python', rs: 'rust', go: 'go', rb: 'ruby', java: 'java',
+          c: 'c', cpp: 'cpp', h: 'c', hpp: 'cpp', cs: 'csharp',
+          swift: 'swift', kt: 'kotlin', scala: 'scala', sh: 'bash',
+          json: 'json', yaml: 'yaml', yml: 'yaml', toml: 'toml',
+          md: 'markdown', html: 'html', css: 'css', scss: 'scss',
+          sql: 'sql', graphql: 'graphql', xml: 'xml',
+        };
+        const lang = langMap[ext] || '';
+
+        // Split into chunks for Telegram's 4096 char limit
+        const maxChunk = 3800;
+        const chunks: string[] = [];
+        let remaining = content;
+
+        while (remaining.length > 0) {
+          if (remaining.length <= maxChunk) {
+            chunks.push(remaining);
+            break;
+          }
+          // Try to break at a newline
+          let breakPoint = remaining.lastIndexOf('\n', maxChunk);
+          if (breakPoint < maxChunk / 2) breakPoint = maxChunk;
+          chunks.push(remaining.slice(0, breakPoint));
+          remaining = remaining.slice(breakPoint);
+        }
+
+        // Send first chunk as edit, rest as new messages
+        const fileName = filepath.split('/').pop();
+        await ctx.editMessageText(
+          `📄 *${fileName}* (1/${chunks.length})\n\`\`\`${lang}\n${chunks[0]}\n\`\`\``,
+          { parse_mode: 'Markdown' }
+        );
+
+        // Send remaining chunks
+        for (let i = 1; i < chunks.length; i++) {
+          await ctx.reply(
+            `📄 *${fileName}* (${i + 1}/${chunks.length})\n\`\`\`${lang}\n${chunks[i]}\n\`\`\``,
+            { parse_mode: 'Markdown' }
+          );
+        }
+      } catch (error) {
+        await ctx.editMessageText(`❌ Failed to read file: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      }
+      return;
+    }
+
+    if (data.startsWith('copypath:')) {
+      const filepath = data.slice(9);
+      const success = await copyToClipboard(filepath);
+      if (success) {
+        await ctx.answerCallbackQuery({ text: '📋 Path copied to Mac clipboard!' });
+      } else {
+        await ctx.answerCallbackQuery({ text: 'Failed to copy path' });
+      }
+      return;
+    }
+
+    // Handle tmux session actions
+    if (data.startsWith('tmux:')) {
+      const parts = data.split(':');
+      const action = parts[1];
+
+      if (action === 'attach') {
+        const sessionName = parts[2];
+        if (!sessionName) {
+          await ctx.answerCallbackQuery({ text: 'Invalid session' });
+          return;
+        }
+
+        // Check if session exists
+        const exists = await isTmuxSessionActive(sessionName);
+        if (!exists) {
+          await ctx.answerCallbackQuery({ text: `Session '${sessionName}' not found` });
+          return;
+        }
+
+        // Attach to session
+        setTmuxMode(userId, true, sessionName);
+        await clearScrollback(sessionName);
+
+        let screen = await capturePane(sessionName);
+        userLastScreen.set(userId, screen);
+
+        if (screen.length > 2000) {
+          screen = screen.slice(-2000);
+        }
+
+        const cwd = await getTmuxCwd(sessionName);
+
+        await ctx.editMessageText(
+          `🟢 *Attached to* \`${sessionName}\`\n` +
+          (cwd ? `📁 ${cwd}\n\n` : '\n') +
+          '```\n' + (screen || '(empty)') + '\n```',
+          { parse_mode: 'Markdown', reply_markup: getMainMenuKeyboard(true) }
+        );
+        return;
+      }
+
+      if (action === 'new') {
+        await ctx.editMessageText(
+          '*Create New Session*\n\nType `/tmux new <name>`\n\nExample: `/tmux new work`',
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
+
+      if (action === 'kill_menu') {
+        const sessions = await listTmuxSessions();
+        if (sessions.length === 0) {
+          await ctx.answerCallbackQuery({ text: 'No sessions to kill' });
+          return;
+        }
+
+        const keyboard = new InlineKeyboard();
+        sessions.forEach((s, i) => {
+          keyboard.text(`🗑️ ${s.name}`, `tmux:kill:${s.name}`);
+          if (i % 2 === 1) keyboard.row();
+        });
+        keyboard.row().text('◀️ Back', 'action:tmux_list');
+
+        await ctx.editMessageText(
+          '*🗑️ Kill Session*\n\nSelect a session to kill:',
+          { parse_mode: 'Markdown', reply_markup: keyboard }
+        );
+        return;
+      }
+
+      if (action === 'kill') {
+        const sessionName = parts[2];
+        if (!sessionName) {
+          await ctx.answerCallbackQuery({ text: 'Invalid session' });
+          return;
+        }
+
+        // Detach if user is attached to this session
+        const currentSession = getCurrentTmuxSession(userId);
+        if (currentSession === sessionName) {
+          stopAutoRefresh(userId);
+          setTmuxMode(userId, false);
+        }
+
+        await killTmuxSession(sessionName);
+        await ctx.answerCallbackQuery({ text: `Killed ${sessionName}` });
+
+        // Refresh session list
+        const sessions = await listTmuxSessions();
+        if (sessions.length === 0) {
+          await ctx.editMessageText(
+            '*No tmux sessions*\n\nUse /attach to create one.',
+            { parse_mode: 'Markdown' }
+          );
+        } else {
+          const keyboard = new InlineKeyboard();
+          sessions.forEach((s, i) => {
+            const icon = s.attached ? '🟢' : '⚪';
+            keyboard.text(`${icon} ${s.name}`, `tmux:attach:${s.name}`);
+            if (i % 2 === 1) keyboard.row();
+          });
+          keyboard.row().text('➕ New', 'tmux:new').text('🗑️ Kill', 'tmux:kill_menu');
+
+          await ctx.editMessageText(
+            '*📺 Tmux Sessions*\n\n' +
+            sessions.map(s => {
+              const icon = s.attached ? '🟢' : '⚪';
+              return `${icon} \`${s.name}\``;
+            }).join('\n'),
+            { parse_mode: 'Markdown', reply_markup: keyboard }
+          );
+        }
+        return;
+      }
+
+      return;
+    }
+
     // Handle project switching
     if (data.startsWith('project:')) {
       const name = data.slice(8);
       const pin = getPin(userId, name);
+      const session = getCurrentTmuxSession(userId);
 
       if (!pin) {
         await ctx.editMessageText(`Project '${name}' not found.`);
@@ -1883,9 +2506,9 @@ export function setupBot(
       const escapedPath = pin.path.replace(/'/g, "'\\''");
       const cdCommand = `cd '${escapedPath}'`;
 
-      if (isInTmuxMode(userId)) {
-        await sendToTmux(cdCommand);
-        await sendEnterToTmux();
+      if (session) {
+        await sendToTmux(cdCommand, session);
+        await sendEnterToTmux(session);
         await new Promise(r => setTimeout(r, 300));
 
         // Load project context if available
@@ -1895,7 +2518,7 @@ export function setupBot(
           contextMsg = `\n\n_🧠 Project has ${getProjectMemories(userId, name).length} memories_`;
         }
 
-        let screen = await capturePane();
+        let screen = await capturePane(session);
         if (screen.length > 2000) {
           screen = screen.slice(-2000);
         }
@@ -1935,7 +2558,8 @@ export function setupBot(
       '/sessions', '/new', '/switch', '/close', '/pwd', '/kill',
       '/history', '/quick', '/pin', '/unpin', '/pins', '/search',
       '/menu', '/reset', '/full', '/status', '/bookmarks', '/usage', '/export',
-      '/voice', '/alias', '/aliases', '/unalias', '/remember', '/memories', '/forget'
+      '/voice', '/alias', '/aliases', '/unalias', '/remember', '/memories', '/forget',
+      '/view', '/context', '/tmux'
     ];
 
     const isTermoCommand = termoCommands.some(cmd =>
@@ -1964,15 +2588,20 @@ export function setupBot(
         userLastCommand.set(userId, expandedCommand);
 
         if (isInTmuxMode(userId)) {
+          const session = getCurrentTmuxSession(userId);
+          if (!session) {
+            await ctx.reply('Not attached to any session. Use /attach first.');
+            return;
+          }
           stopAutoRefresh(userId);
-          await clearScrollback();
+          await clearScrollback(session);
           const thinkingMsg = await ctx.reply('⏳ Running alias...', {
             reply_markup: getClaudeThinkingKeyboard(),
           });
-          await sendToTmux(expandedCommand);
-          await sendEnterToTmux();
+          await sendToTmux(expandedCommand, session);
+          await sendEnterToTmux(session);
           await new Promise(r => setTimeout(r, 500));
-          const screen = await capturePane();
+          const screen = await capturePane(session);
           userLastScreen.set(userId, screen);
           startAutoRefresh(userId, ctx.chat!.id, bot, screen, thinkingMsg.message_id, expandedCommand);
           return;
@@ -1984,33 +2613,30 @@ export function setupBot(
       }
     }
 
-    // Auto-attach if tmux session exists (handles bot restarts)
-    if (!isInTmuxMode(userId)) {
-      const tmuxActive = await isTmuxSessionActive();
-      if (tmuxActive) {
-        // Auto-attach to existing tmux session
-        setTmuxMode(userId, true);
-      }
-    }
-
     // Track last command for retry
     userLastCommand.set(userId, text);
 
     // If in tmux mode, send to tmux
     if (isInTmuxMode(userId)) {
+      const session = getCurrentTmuxSession(userId);
+      if (!session) {
+        await ctx.reply('Not attached to any session. Use /attach first.');
+        return;
+      }
+
       // Stop any existing auto-refresh
       stopAutoRefresh(userId);
 
       // Clear old scrollback to prevent "ghosts from the grave"
-      await clearScrollback();
+      await clearScrollback(session);
 
       // Show thinking message - stays visible until Claude is done
       const thinkingMsg = await ctx.reply('⏳ Sending to Claude...', {
         reply_markup: getClaudeThinkingKeyboard(),
       });
 
-      await sendToTmux(text);
-      await sendEnterToTmux();
+      await sendToTmux(text, session);
+      await sendEnterToTmux(session);
 
       // Add to history so search works for Claude messages too
       const sessionName = getActiveSessionName(userId);
@@ -2020,7 +2646,7 @@ export function setupBot(
       await new Promise(r => setTimeout(r, 500));
 
       // Get initial screen (after message sent)
-      const screen = await capturePane();
+      const screen = await capturePane(session);
       userLastScreen.set(userId, screen);
 
       // Start auto-refresh - pass user's message to find where response starts
@@ -2159,29 +2785,26 @@ export function setupBot(
         return;
       }
 
-      // Auto-attach if tmux session exists
-      if (!isInTmuxMode(userId)) {
-        const tmuxActive = await isTmuxSessionActive();
-        if (tmuxActive) {
-          setTmuxMode(userId, true);
-        }
-      }
-
       // Prepare message with extracted text
       const messageToSend = caption
         ? `${caption}\n\nExtracted text from image:\n${ocrText}`
         : `Here's text I extracted from a screenshot:\n${ocrText}`;
 
       if (isInTmuxMode(userId)) {
+        const session = getCurrentTmuxSession(userId);
+        if (!session) {
+          await ctx.reply('Not attached to any session. Use /attach first.');
+          return;
+        }
         // Clear old scrollback to prevent "ghosts from the grave"
-        await clearScrollback();
+        await clearScrollback(session);
 
         // Send to Claude via tmux
-        await sendToTmux(messageToSend);
-        await sendEnterToTmux();
+        await sendToTmux(messageToSend, session);
+        await sendEnterToTmux(session);
 
         await new Promise(r => setTimeout(r, 1000));
-        let screen = await capturePane();
+        let screen = await capturePane(session);
 
         // Truncate screen to avoid message too long
         const screenLines = screen.split('\n');
@@ -2284,8 +2907,13 @@ export function setupBot(
 
     // We have transcribed text - process it
     if (isInTmuxMode(userId)) {
+      const session = getCurrentTmuxSession(userId);
+      if (!session) {
+        await ctx.reply('Not attached to any session. Use /attach first.');
+        return;
+      }
       stopAutoRefresh(userId);
-      await clearScrollback();
+      await clearScrollback(session);
 
       const thinkingMsg = await ctx.reply(
         `🎤 *Voice → Claude:*\n_"${text.slice(0, 100)}${text.length > 100 ? '...' : ''}"_`,
@@ -2295,15 +2923,15 @@ export function setupBot(
         }
       );
 
-      await sendToTmux(text);
-      await sendEnterToTmux();
+      await sendToTmux(text, session);
+      await sendEnterToTmux(session);
 
       // Add to history
       const sessionName = getActiveSessionName(userId);
       addHistoryEntry(userId, sessionName, `🎤 ${text}`, 'claude', null, 0);
 
       await new Promise(r => setTimeout(r, 500));
-      const screen = await capturePane();
+      const screen = await capturePane(session);
       userLastScreen.set(userId, screen);
       userLastCommand.set(userId, text);
       startAutoRefresh(userId, ctx.chat!.id, bot, screen, thinkingMsg.message_id, text);

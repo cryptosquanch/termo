@@ -1,3 +1,6 @@
+import { resolve, normalize } from 'path';
+import { homedir } from 'os';
+
 export interface ValidationResult {
   allowed: boolean;
   requiresConfirmation: boolean;
@@ -109,4 +112,89 @@ export function getInteractiveWarning(command: string): string | null {
   }
 
   return null;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// File Path Validation - Prevent arbitrary file reads
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Sensitive files that should never be read
+const BLOCKED_FILE_PATTERNS: RegExp[] = [
+  /^\/etc\/shadow$/,
+  /^\/etc\/passwd$/,
+  /^\/etc\/sudoers/,
+  /\.ssh\/.*_rsa$/,       // Private SSH keys
+  /\.ssh\/.*_ed25519$/,   // Private SSH keys
+  /\.ssh\/.*_dsa$/,       // Private SSH keys
+  /\.gnupg\//,            // GPG keys
+  /\.aws\/credentials$/,
+  /\.netrc$/,
+  /\.npmrc$/,             // Often contains tokens
+  /\.pypirc$/,
+  /\.docker\/config\.json$/,
+  /keychain/i,
+];
+
+// Allowed directory prefixes (resolved to absolute paths)
+const ALLOWED_PREFIXES: string[] = [
+  homedir(),              // User's home directory
+  '/tmp',                 // Temp files
+  '/var/folders',         // macOS temp folders
+];
+
+export interface PathValidationResult {
+  allowed: boolean;
+  reason?: string;
+  resolvedPath?: string;
+}
+
+/**
+ * Validate a file path for safe reading
+ * Prevents path traversal and access to sensitive files
+ */
+export function validateFilePath(filepath: string): PathValidationResult {
+  try {
+    // Normalize and resolve to absolute path
+    const resolved = resolve(normalize(filepath));
+
+    // Check for blocked file patterns
+    for (const pattern of BLOCKED_FILE_PATTERNS) {
+      if (pattern.test(resolved)) {
+        return {
+          allowed: false,
+          reason: 'Access to this file type is blocked for security',
+        };
+      }
+    }
+
+    // Check if .env file (contains secrets)
+    if (/\.env($|\.)/.test(resolved)) {
+      return {
+        allowed: false,
+        reason: 'Access to .env files is blocked (may contain secrets)',
+      };
+    }
+
+    // Check if path is within allowed directories
+    const isAllowed = ALLOWED_PREFIXES.some(prefix =>
+      resolved.startsWith(prefix + '/') || resolved === prefix
+    );
+
+    if (!isAllowed) {
+      return {
+        allowed: false,
+        reason: `File must be within home directory or /tmp`,
+      };
+    }
+
+    return {
+      allowed: true,
+      resolvedPath: resolved,
+    };
+  } catch (error) {
+    return {
+      allowed: false,
+      reason: 'Invalid file path',
+    };
+  }
 }

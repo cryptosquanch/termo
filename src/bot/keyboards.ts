@@ -296,3 +296,97 @@ export function getUsageKeyboard(): InlineKeyboard {
     .row()
     .text('◀️ Back', 'action:menu');
 }
+
+// Quick project switcher bar - compact, always visible
+export function getQuickProjectsBar(
+  pins: PinnedProject[],
+  currentProject?: string
+): InlineKeyboard {
+  const keyboard = new InlineKeyboard();
+
+  if (pins.length === 0) {
+    // No pins yet - show helpful prompt
+    keyboard.text('📍 Pin a project', 'action:pin_prompt');
+    return keyboard;
+  }
+
+  // Show up to 4 projects in a single row for quick switching
+  const maxShow = 4;
+  const toShow = pins.slice(0, maxShow);
+
+  toShow.forEach((pin) => {
+    // Use emoji to indicate current project
+    const isCurrent = pin.name === currentProject;
+    const icon = isCurrent ? '📂' : '📁';
+    // Truncate long names
+    const name = pin.name.length > 8 ? pin.name.slice(0, 7) + '…' : pin.name;
+    keyboard.text(`${icon}${name}`, `project:${pin.name}`);
+  });
+
+  // If more than 4, show "more" button
+  if (pins.length > maxShow) {
+    keyboard.text(`+${pins.length - maxShow}`, 'action:projects');
+  }
+
+  return keyboard;
+}
+
+// Enhanced Claude done keyboard with quick project bar
+export function getClaudeDoneWithProjectsKeyboard(
+  context: string,
+  pins: PinnedProject[],
+  currentProject?: string
+): InlineKeyboard {
+  const keyboard = new InlineKeyboard();
+
+  // Top row: Most common actions
+  keyboard
+    .text('📋 Copy', 'action:copy')
+    .text('⭐ Save', 'action:bookmark')
+    .text('📄 Full', 'action:full');
+
+  // Middle row: Context-aware suggestions
+  keyboard.row();
+
+  const lowerCtx = context.toLowerCase();
+  const hasError = lowerCtx.includes('error') || lowerCtx.includes('failed') || lowerCtx.includes('exception');
+  const isQuestion = context.includes('?') || lowerCtx.includes('would you like') || lowerCtx.includes('should i');
+  const hasCode = context.includes('```') || lowerCtx.includes('function') || lowerCtx.includes('const ');
+
+  if (hasError) {
+    keyboard.text('🔧 Fix this', 'smart:fix');
+  } else if (isQuestion) {
+    keyboard.text('✅ Yes', 'smart:yes').text('❌ No', 'smart:no');
+  } else if (hasCode) {
+    keyboard.text('▶️ Run it', 'smart:run');
+  } else {
+    keyboard.text('➡️ Continue', 'smart:continue');
+  }
+
+  keyboard.text('🧠 Ultrathink', 'smart:ultrathink');
+
+  // Third row: Utils
+  keyboard.row()
+    .text('💰 Usage', 'smart:usage')
+    .text('📋 Menu', 'action:menu');
+
+  // Bottom row: Quick project switcher (if has pins)
+  if (pins.length > 0) {
+    keyboard.row();
+    const maxShow = 4;
+    const toShow = pins.slice(0, maxShow);
+
+    toShow.forEach((pin) => {
+      const isCurrent = pin.name === currentProject;
+      const icon = isCurrent ? '📂' : '📁';
+      const name = pin.name.length > 6 ? pin.name.slice(0, 5) + '…' : pin.name;
+      keyboard.text(`${icon}${name}`, `project:${pin.name}`);
+    });
+
+    if (pins.length > maxShow) {
+      keyboard.text(`+${pins.length - maxShow}`, 'action:projects');
+    }
+  }
+
+  return keyboard;
+}
