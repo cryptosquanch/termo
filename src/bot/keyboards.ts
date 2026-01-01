@@ -176,6 +176,107 @@ export function formatBreadcrumb(cwd: string): string {
   return `📍 ${displayPath}`;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Collapsible Output - Show/hide portions of long outputs
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Generate collapsed output keyboard
+ * Shows options to view first/last N lines or full output
+ */
+export function getCollapsedOutputKeyboard(
+  outputId: string,
+  totalLines: number,
+  currentView: 'first' | 'last' | 'middle' | 'full' = 'first'
+): InlineKeyboard {
+  const keyboard = new InlineKeyboard();
+
+  // View options row
+  if (currentView !== 'first') {
+    keyboard.text('⬆️ First 15', `output:first:${outputId}`);
+  }
+  if (currentView !== 'last') {
+    keyboard.text('⬇️ Last 15', `output:last:${outputId}`);
+  }
+
+  keyboard.row();
+
+  // Full output option
+  keyboard.text('📄 Full Output', `output:full:${outputId}`);
+  keyboard.text('📋 Copy', `output:copy:${outputId}`);
+
+  // Info row
+  keyboard.row();
+  keyboard.text(`📊 ${totalLines} lines total`, 'action:noop');
+
+  return keyboard;
+}
+
+/**
+ * Format collapsed output header
+ */
+export function formatCollapsedHeader(
+  totalLines: number,
+  showingStart: number,
+  showingEnd: number,
+  view: 'first' | 'last' | 'full'
+): string {
+  if (view === 'full') {
+    return `📤 *Output* (${totalLines} lines)`;
+  }
+  return `📤 *Output* (showing ${showingStart}-${showingEnd} of ${totalLines} lines)`;
+}
+
+/**
+ * Check if output should be collapsed (more than threshold lines)
+ */
+export function shouldCollapseOutput(content: string, threshold = 20): boolean {
+  const lineCount = content.split('\n').length;
+  return lineCount > threshold;
+}
+
+/**
+ * Get line count of content
+ */
+export function getLineCount(content: string): number {
+  return content.split('\n').length;
+}
+
+/**
+ * Extract portion of output
+ */
+export function extractOutputPortion(
+  content: string,
+  view: 'first' | 'last' | 'full',
+  lineCount = 15
+): { text: string; start: number; end: number } {
+  const lines = content.split('\n');
+  const total = lines.length;
+
+  switch (view) {
+    case 'first':
+      return {
+        text: lines.slice(0, lineCount).join('\n'),
+        start: 1,
+        end: Math.min(lineCount, total),
+      };
+    case 'last':
+      const startLine = Math.max(0, total - lineCount);
+      return {
+        text: lines.slice(startLine).join('\n'),
+        start: startLine + 1,
+        end: total,
+      };
+    case 'full':
+    default:
+      return {
+        text: content,
+        start: 1,
+        end: total,
+      };
+  }
+}
+
 // Pinned projects keyboard
 export function getProjectsKeyboard(pins: PinnedProject[], currentDir?: string): InlineKeyboard {
   const keyboard = new InlineKeyboard();

@@ -1,4 +1,4 @@
-import { Bot, Context, InlineKeyboard } from 'grammy';
+import { Bot, Context, InlineKeyboard, InputFile } from 'grammy';
 import { randomBytes } from 'crypto';
 import { Config } from '../config.js';
 import { TerminalExecutor } from '../terminal/executor.js';
@@ -43,6 +43,11 @@ import {
   getUsageKeyboard,
   getBreadcrumbKeyboard,
   formatBreadcrumb,
+  getCollapsedOutputKeyboard,
+  formatCollapsedHeader,
+  shouldCollapseOutput,
+  getLineCount,
+  extractOutputPortion,
 } from './keyboards.js';
 import {
   addBookmark,
@@ -106,6 +111,44 @@ const userAutoRefresh = new Map<number, NodeJS.Timeout>();
 const userLastCommand = new Map<number, string>();
 // Track last activity time per user for cleanup
 const userLastActivity = new Map<number, number>();
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Collapsible Output Storage - Store full outputs for expand/collapse
+// ─────────────────────────────────────────────────────────────────────────────
+interface StoredOutput {
+  content: string;
+  timestamp: number;
+  userId: number;
+}
+const storedOutputs = new Map<string, StoredOutput>();
+const OUTPUT_EXPIRY = 30 * 60 * 1000; // 30 minutes
+
+function storeOutput(userId: number, content: string): string {
+  // Generate unique ID
+  const outputId = randomBytes(8).toString('hex');
+  storedOutputs.set(outputId, {
+    content,
+    timestamp: Date.now(),
+    userId,
+  });
+
+  // Cleanup old outputs
+  const now = Date.now();
+  for (const [id, output] of storedOutputs.entries()) {
+    if (now - output.timestamp > OUTPUT_EXPIRY) {
+      storedOutputs.delete(id);
+    }
+  }
+
+  return outputId;
+}
+
+function getStoredOutput(outputId: string, userId: number): string | null {
+  const output = storedOutputs.get(outputId);
+  if (!output) return null;
+  if (output.userId !== userId) return null; // Security: only owner can access
+  return output.content;
+}
 
 // Memory cleanup - remove stale entries after 1 hour of inactivity
 const CLEANUP_INTERVAL = 60 * 60 * 1000; // 1 hour
@@ -1842,6 +1885,78 @@ export function setupBot(
       return;
     }
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // Collapsible Output Handlers
+    // ─────────────────────────────────────────────────────────────────────────
+    if (data.startsWith('output:')) {
+      const parts = data.slice(7).split(':');
+      const action = parts[0] as 'first' | 'last' | 'full' | 'copy';
+      const outputId = parts[1];
+
+      const content = getStoredOutput(outputId, userId);
+      if (!content) {
+        await ctx.answerCallbackQuery({ text: 'Output expired. Run command again.', show_alert: true });
+        return;
+      }
+
+      const totalLines = getLineCount(content);
+
+      if (action === 'copy') {
+        // Copy to clipboard
+        const { copyToClipboard } = await import('../utils/system.js');
+        const success = await copyToClipboard(content);
+        if (success) {
+          await ctx.answerCallbackQuery({ text: '📋 Copied to Mac clipboard!' });
+        } else {
+          await ctx.answerCallbackQuery({ text: 'Failed to copy' });
+        }
+        return;
+      }
+
+      if (action === 'full') {
+        // Send as file for very long output
+        if (totalLines > 100) {
+          const buffer = Buffer.from(content, 'utf-8');
+          await ctx.replyWithDocument(
+            new InputFile(buffer, 'output.txt'),
+            { caption: `📄 Full output (${totalLines} lines)` }
+          );
+          await ctx.answerCallbackQuery({ text: 'Sent as file' });
+          return;
+        }
+
+        // Show full output inline (chunked if needed)
+        const maxChunk = 3500;
+        if (content.length <= maxChunk) {
+          await ctx.editMessageText(
+            `${formatCollapsedHeader(totalLines, 1, totalLines, 'full')}\n\`\`\`\n${content}\n\`\`\``,
+            {
+              parse_mode: 'Markdown',
+              reply_markup: getCollapsedOutputKeyboard(outputId, totalLines, 'full'),
+            }
+          );
+        } else {
+          // Too long for edit, send as new message
+          await ctx.reply(
+            `📄 *Full Output* (${totalLines} lines)\n\`\`\`\n${content.slice(0, maxChunk)}\n\`\`\`\n_(truncated, use Copy for full)_`,
+            { parse_mode: 'Markdown' }
+          );
+        }
+        return;
+      }
+
+      // Show first or last portion
+      const portion = extractOutputPortion(content, action, 15);
+      await ctx.editMessageText(
+        `${formatCollapsedHeader(totalLines, portion.start, portion.end, action)}\n\`\`\`\n${portion.text}\n\`\`\``,
+        {
+          parse_mode: 'Markdown',
+          reply_markup: getCollapsedOutputKeyboard(outputId, totalLines, action),
+        }
+      );
+      return;
+    }
+
     if (data.startsWith('history:')) {
       const command = data.slice(8);
       // If it's a slash command, tell user to type it instead
@@ -3081,9 +3196,26 @@ async function executeCommand(
       await ctx.api.deleteMessage(ctx.chat!.id, statusMsg.message_id);
     } catch {}
 
-    const chunks = formatOutput(result.output, result.truncated);
-    for (const chunk of chunks) {
-      await ctx.reply(chunk, { parse_mode: 'Markdown' });
+    // Check if output should be collapsed
+    if (shouldCollapseOutput(result.output, 25)) {
+      // Store output for expand/collapse
+      const outputId = storeOutput(userId, result.output);
+      const totalLines = getLineCount(result.output);
+      const portion = extractOutputPortion(result.output, 'first', 15);
+
+      await ctx.reply(
+        `${formatCollapsedHeader(totalLines, portion.start, portion.end, 'first')}\n\`\`\`\n${portion.text}\n\`\`\``,
+        {
+          parse_mode: 'Markdown',
+          reply_markup: getCollapsedOutputKeyboard(outputId, totalLines, 'first'),
+        }
+      );
+    } else {
+      // Short output - show directly
+      const chunks = formatOutput(result.output, result.truncated);
+      for (const chunk of chunks) {
+        await ctx.reply(chunk, { parse_mode: 'Markdown' });
+      }
     }
 
     if (result.newCwd) {
@@ -3091,7 +3223,7 @@ async function executeCommand(
     }
 
     if (result.exitCode !== 0) {
-      await ctx.reply(` Exit code: ${result.exitCode} (${formatDuration(result.duration)})`);
+      await ctx.reply(`❌ Exit code: ${result.exitCode} (${formatDuration(result.duration)})`);
     }
 
   } catch (error) {
