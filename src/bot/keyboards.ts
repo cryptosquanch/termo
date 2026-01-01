@@ -114,6 +114,68 @@ export function getGitKeyboard(): InlineKeyboard {
     .text('Back', 'action:menu');
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Breadcrumb Navigation - Always show current path with quick nav
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Generate breadcrumb navigation keyboard
+ * Shows: 📍 ~/path/to/dir  [⬆️ Up] [🏠 Home] [📌 Pin]
+ */
+export function getBreadcrumbKeyboard(cwd: string, pins?: PinnedProject[]): InlineKeyboard {
+  const keyboard = new InlineKeyboard();
+  const home = process.env.HOME || '/Users';
+
+  // Shorten path for display (replace home with ~)
+  const displayPath = cwd.replace(home, '~');
+
+  // Check if we're at home or root
+  const isHome = cwd === home;
+  const isRoot = cwd === '/';
+
+  // Navigation row
+  if (!isRoot && !isHome) {
+    keyboard.text('⬆️ Up', 'nav:up');
+  }
+  if (!isHome) {
+    keyboard.text('🏠 Home', 'nav:home');
+  }
+  keyboard.text('📌 Pin', 'action:pin_prompt');
+
+  // Quick access to pinned projects (if any and not already there)
+  if (pins && pins.length > 0) {
+    keyboard.row();
+    const quickPins = pins.slice(0, 3);
+    quickPins.forEach(pin => {
+      const isHere = pin.path === cwd;
+      const icon = isHere ? '📂' : '📁';
+      const name = pin.name.length > 8 ? pin.name.slice(0, 7) + '…' : pin.name;
+      keyboard.text(`${icon}${name}`, `project:${pin.name}`);
+    });
+  }
+
+  return keyboard;
+}
+
+/**
+ * Format breadcrumb display text
+ * Returns: "📍 ~/projects/termo/src"
+ */
+export function formatBreadcrumb(cwd: string): string {
+  const home = process.env.HOME || '/Users';
+  const displayPath = cwd.replace(home, '~');
+
+  // Truncate if too long
+  if (displayPath.length > 40) {
+    const parts = displayPath.split('/');
+    if (parts.length > 4) {
+      return `📍 ${parts[0]}/…/${parts.slice(-2).join('/')}`;
+    }
+  }
+
+  return `📍 ${displayPath}`;
+}
+
 // Pinned projects keyboard
 export function getProjectsKeyboard(pins: PinnedProject[], currentDir?: string): InlineKeyboard {
   const keyboard = new InlineKeyboard();

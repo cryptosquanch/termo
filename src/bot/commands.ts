@@ -9,6 +9,7 @@ import {
   closeSession,
   getOrCreateDefaultSession,
   restoreSessionsFromDb,
+  updateCwd,
   TerminalSession,
 } from '../terminal/session-manager.js';
 import {
@@ -40,6 +41,8 @@ import {
   getBookmarksKeyboard,
   getBookmarkViewKeyboard,
   getUsageKeyboard,
+  getBreadcrumbKeyboard,
+  formatBreadcrumb,
 } from './keyboards.js';
 import {
   addBookmark,
@@ -600,6 +603,9 @@ export function setupBot(
       '/sessions - List all sessions\n' +
       '/new `<name>` - Create new session\n' +
       '/switch `<name>` - Switch to session\n\n' +
+      '*🧭 Navigation:*\n' +
+      '/nav - Show current path with navigation\n' +
+      '/pwd - Show current directory\n\n' +
       '*🔍 Search & History:*\n' +
       '/search `<query>` - Search history\n' +
       '/history - Recent commands\n\n' +
@@ -1114,12 +1120,36 @@ export function setupBot(
     );
   });
 
-  // /pwd command
+  // /pwd command - Show current directory with breadcrumb navigation
   bot.command('pwd', async (ctx) => {
     const userId = ctx.from!.id;
     const sessionName = getActiveSessionName(userId);
     const session = getActiveSession(userId, sessionName) || getOrCreateDefaultSession(userId);
-    await ctx.reply(`\`${session.cwd}\`\nSession: ${session.name}`, { parse_mode: 'Markdown' });
+    const pins = getPins(userId);
+
+    await ctx.reply(
+      `${formatBreadcrumb(session.cwd)}\n_Session: ${session.name}_`,
+      {
+        parse_mode: 'Markdown',
+        reply_markup: getBreadcrumbKeyboard(session.cwd, pins),
+      }
+    );
+  });
+
+  // /nav command - Alias for pwd with breadcrumb navigation
+  bot.command('nav', async (ctx) => {
+    const userId = ctx.from!.id;
+    const sessionName = getActiveSessionName(userId);
+    const session = getActiveSession(userId, sessionName) || getOrCreateDefaultSession(userId);
+    const pins = getPins(userId);
+
+    await ctx.reply(
+      `${formatBreadcrumb(session.cwd)}\n_Session: ${session.name}_`,
+      {
+        parse_mode: 'Markdown',
+        reply_markup: getBreadcrumbKeyboard(session.cwd, pins),
+      }
+    );
   });
 
   // /kill command
@@ -1763,6 +1793,50 @@ export function setupBot(
         await ctx.editMessageText(
           `Switched to \`${name}\`\nDirectory: \`${shortenPath(session.cwd)}\``,
           { parse_mode: 'Markdown' }
+        );
+      }
+      return;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Breadcrumb Navigation Handlers
+    // ─────────────────────────────────────────────────────────────────────────
+    if (data.startsWith('nav:')) {
+      const action = data.slice(4);
+      const sessionName = getActiveSessionName(userId);
+      const session = getActiveSession(userId, sessionName) || getOrCreateDefaultSession(userId);
+      const pins = getPins(userId);
+      const home = process.env.HOME || '/Users';
+
+      let newCwd = session.cwd;
+
+      switch (action) {
+        case 'up': {
+          // Go up one directory
+          const parts = session.cwd.split('/');
+          if (parts.length > 2) {
+            parts.pop();
+            newCwd = parts.join('/') || '/';
+          }
+          break;
+        }
+        case 'home': {
+          newCwd = home;
+          break;
+        }
+      }
+
+      if (newCwd !== session.cwd) {
+        // Update session cwd (this updates both memory and DB)
+        updateCwd(userId, sessionName, newCwd);
+
+        // Show updated breadcrumb
+        await ctx.editMessageText(
+          `${formatBreadcrumb(newCwd)}\n_Session: ${session.name}_`,
+          {
+            parse_mode: 'Markdown',
+            reply_markup: getBreadcrumbKeyboard(newCwd, pins),
+          }
         );
       }
       return;
