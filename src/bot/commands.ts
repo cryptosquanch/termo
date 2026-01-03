@@ -94,12 +94,12 @@ import { setProjectMemory, getProjectMemory, getProjectMemories, deleteProjectMe
 import { getUserSettings, setVoiceInput, setVoiceOutput, setCurrentProject, getCurrentProject } from '../storage/settings.js';
 
 // Auto-refresh configuration
-const AUTO_REFRESH_INTERVAL = 3000; // Check every 3 seconds (for detection)
-const UI_UPDATE_INTERVAL = 8000; // Update UI every 8 seconds (less flashing)
+const AUTO_REFRESH_INTERVAL = 5000; // Check every 5 seconds (for detection)
+const UI_UPDATE_INTERVAL = 15000; // Update UI every 15 seconds (much less flashing)
 const AUTO_REFRESH_TIMEOUT = 600000; // Stop after 10 minutes (Claude can take a while)
-const STABLE_COUNT_THRESHOLD = 5; // Stop if screen unchanged for 5 checks (~15 sec stable)
-const FORCE_DONE_STABLE_COUNT = 8; // Force done after 8 stable checks (~24 sec) even if "thinking"
-const MIN_CHANGE_LINES = 2; // Only update if at least 2 lines changed
+const STABLE_COUNT_THRESHOLD = 4; // Stop if screen unchanged for 4 checks (~20 sec stable)
+const FORCE_DONE_STABLE_COUNT = 6; // Force done after 6 stable checks (~30 sec) even if "thinking"
+const MIN_CHANGE_LINES = 3; // Only update if at least 3 lines changed
 
 // Track active session per user
 const userActiveSessions = new Map<number, string>();
@@ -739,12 +739,62 @@ export function setupBot(
 
     // Check if session exists, create if not
     const isActive = await isTmuxSessionActive(sessionName);
+    let isNewSession = false;
+
     if (!isActive) {
       await ctx.reply(`Creating tmux session \`${sessionName}\`...`, { parse_mode: 'Markdown' });
       const created = await createTmuxSession(sessionName);
       if (!created) {
         await ctx.reply(`Failed to create tmux session \`${sessionName}\`.`, { parse_mode: 'Markdown' });
         return;
+      }
+      isNewSession = true;
+
+      // Start Claude Code in the new session
+      await ctx.reply('🚀 Starting Claude Code...');
+      await sendToTmux('claude', sessionName);
+      await sendEnterToTmux(sessionName);
+
+      // Wait for Claude to initialize (check for ready prompt)
+      let attempts = 0;
+      const maxAttempts = 20; // 10 seconds max wait
+      while (attempts < maxAttempts) {
+        await new Promise(r => setTimeout(r, 500));
+        const screen = await capturePane(sessionName);
+        // Check if Claude is ready (shows > prompt or similar)
+        if (screen.includes('>') || screen.includes('Claude') || screen.includes('ready')) {
+          break;
+        }
+        attempts++;
+      }
+    }
+
+    // Check if Claude is running in existing session
+    if (!isNewSession) {
+      const screen = await capturePane(sessionName);
+      const hasClaude = screen.includes('>') || screen.includes('Claude') ||
+                        screen.includes('claude') || screen.includes('⏺');
+
+      if (!hasClaude) {
+        // Claude not running - ask if user wants to start it
+        await ctx.reply(
+          `⚠️ Session \`${sessionName}\` exists but Claude Code doesn't seem to be running.\n\n` +
+          'Starting Claude Code...',
+          { parse_mode: 'Markdown' }
+        );
+        await sendToTmux('claude', sessionName);
+        await sendEnterToTmux(sessionName);
+
+        // Wait for Claude to initialize
+        let attempts = 0;
+        while (attempts < 20) {
+          await new Promise(r => setTimeout(r, 500));
+          const newScreen = await capturePane(sessionName);
+          if (newScreen.includes('>') || newScreen.includes('Claude') || newScreen.includes('ready')) {
+            break;
+          }
+          attempts++;
+        }
       }
     }
 
