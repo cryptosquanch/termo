@@ -2855,6 +2855,30 @@ export function setupBot(
     // Track last command for retry
     userLastCommand.set(userId, text);
 
+    // Detect likely command typos (case-insensitive, short messages starting with command word)
+    const commandWords = ['attach', 'detach', 'screen', 'sessions', 'menu', 'help', 'status', 'pins', 'ctrlc', 'reset', 'kill', 'switch'];
+    const words = text.split(/\s+/);
+    const firstWord = words[0].toLowerCase();
+
+    // Only trigger if: starts with command word AND is short (< 5 words) AND not a question/sentence
+    const looksLikeCommand = commandWords.includes(firstWord) &&
+                             words.length <= 4 &&
+                             !text.includes('?') &&
+                             !text.toLowerCase().includes('please') &&
+                             !text.toLowerCase().includes('can you');
+
+    if (looksLikeCommand) {
+      const args = words.slice(1).join(' ');
+      const fullCommand = args ? `/${firstWord} ${args}` : `/${firstWord}`;
+
+      await ctx.reply(
+        `💡 Did you mean \`${fullCommand}\`? Commands need \`/\` prefix.\n\n` +
+        `Send again with \`/\` or ignore this if you meant to type in terminal.`,
+        { parse_mode: 'Markdown' }
+      );
+      return; // Don't send to terminal - they probably made a typo
+    }
+
     // If in tmux mode, send to tmux
     if (isInTmuxMode(userId)) {
       const session = getCurrentTmuxSession(userId);
