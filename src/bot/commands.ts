@@ -1,4 +1,6 @@
 import { Bot, Context, InlineKeyboard, InputFile } from 'grammy';
+import { saveTerminalScreenshot } from '../utils/terminal-image.js';
+import * as fs from 'fs';
 import { randomBytes } from 'crypto';
 import { Config } from '../config.js';
 import { TerminalExecutor } from '../terminal/executor.js';
@@ -92,6 +94,7 @@ import { copyToClipboard, notifyTaskComplete, transcribeAudio, isWhisperAvailabl
 import { setShortcut, getShortcut, getShortcuts, deleteShortcut } from '../storage/shortcuts.js';
 import { setProjectMemory, getProjectMemory, getProjectMemories, deleteProjectMemory, getProjectContext } from '../storage/project-memory.js';
 import { getUserSettings, setVoiceInput, setVoiceOutput, setCurrentProject, getCurrentProject } from '../storage/settings.js';
+import { saveActiveTmuxSession, clearActiveTmuxSession, getActiveTmuxSession, getAllActiveTmuxSessions } from '../storage/database.js';
 
 // Auto-refresh configuration
 const AUTO_REFRESH_INTERVAL = 5000; // Check every 5 seconds (for detection)
@@ -100,6 +103,10 @@ const AUTO_REFRESH_TIMEOUT = 600000; // Stop after 10 minutes (Claude can take a
 const STABLE_COUNT_THRESHOLD = 4; // Stop if screen unchanged for 4 checks (~20 sec stable)
 const FORCE_DONE_STABLE_COUNT = 6; // Force done after 6 stable checks (~30 sec) even if "thinking"
 const MIN_CHANGE_LINES = 3; // Only update if at least 3 lines changed
+
+// Quiet mode: show screenshot while waiting, final text when done (no message edit flicker)
+const QUIET_MODE = true;
+const SCREENSHOT_UPDATE_INTERVAL = 20000; // Update screenshot every 20 seconds
 
 // Track active session per user
 const userActiveSessions = new Map<number, string>();
@@ -198,9 +205,35 @@ function isInTmuxMode(userId: number): boolean {
 function setTmuxMode(userId: number, enabled: boolean, sessionName?: string): void {
   if (enabled && sessionName) {
     setUserTmuxSession(userId, sessionName);
+    // Persist to database for restart recovery
+    saveActiveTmuxSession(userId, sessionName);
   } else if (!enabled) {
     clearUserTmuxSession(userId);
+    // Clear from database
+    clearActiveTmuxSession(userId);
   }
+}
+
+// Restore sessions from database on startup (validates tmux sessions still exist)
+async function restoreSessionsFromDatabase(): Promise<number> {
+  const savedSessions = getAllActiveTmuxSessions();
+  let restored = 0;
+
+  for (const { userId, sessionName } of savedSessions) {
+    // Verify tmux session still exists
+    const isActive = await isTmuxSessionActive(sessionName);
+    if (isActive) {
+      setUserTmuxSession(userId, sessionName);
+      restored++;
+      console.log(`[Termo] Restored session: user ${userId} → ${sessionName}`);
+    } else {
+      // Session no longer exists, clean up DB
+      clearActiveTmuxSession(userId);
+      console.log(`[Termo] Cleaned stale session: user ${userId} → ${sessionName} (tmux session gone)`);
+    }
+  }
+
+  return restored;
 }
 
 // Get current user's tmux session name
@@ -330,88 +363,108 @@ async function startAutoRefresh(
           await bot.api.sendChatAction(chatId, 'typing');
         } catch {}
 
-        // Only update UI message every UI_UPDATE_INTERVAL (reduces flashing)
         const now = Date.now();
-        if (lastMessageId && (now - lastUiUpdate) >= UI_UPDATE_INTERVAL) {
-          lastUiUpdate = now;
-          const elapsed = Math.floor((now - startTime) / 1000);
 
-          // Format elapsed time nicely
-          const mins = Math.floor(elapsed / 60);
-          const secs = elapsed % 60;
-          const timeStr = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
+        if (QUIET_MODE) {
+          // Quiet mode: send screenshot updates instead of editing text
+          if ((now - lastUiUpdate) >= SCREENSHOT_UPDATE_INTERVAL) {
+            lastUiUpdate = now;
+            const elapsed = Math.floor((now - startTime) / 1000);
+            const mins = Math.floor(elapsed / 60);
+            const secs = elapsed % 60;
+            const timeStr = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
 
-          // Extract Claude's response preview (cleaned)
-          let preview = '';
-          if (messageToFind) {
-            const lines = currentScreen.split('\n');
-            let startIndex = 0;
-            // Find where user's message was (response comes after)
-            for (let i = 0; i < lines.length; i++) {
-              if (lines[i].includes(messageToFind.slice(0, 30))) {
-                startIndex = i + 1;
-                break;
-              }
-            }
-            if (startIndex > 0) {
-              // Get Claude's response and clean it
-              let responseLines = lines.slice(startIndex);
-              // Clean terminal UI noise
-              responseLines = responseLines.filter(line => {
-                if (line.includes('───────')) return false;
-                if (line.match(/^>\s*$/)) return false;
-                if (line.includes('esc to interrupt')) return false;
-                if (line.includes('Context left until')) return false;
-                if (line.includes('shift+tab')) return false;
-                if (line.includes('bypass permissions')) return false;
-                if (line.match(/^\s*✦\s*(Thinking|Reading|Writing)/)) return false;
-                return true;
+            try {
+              // Generate terminal screenshot
+              const screenshotPath = await saveTerminalScreenshot(currentScreen, {
+                title: `Claude working... (${timeStr})`,
+                maxLines: 30,
               });
-              const cleaned = responseLines.join('\n').trim();
-              if (cleaned.length > 30) {
-                // Show last 600 chars of response
-                preview = cleaned.length > 600
-                  ? '...' + cleaned.slice(-600)
-                  : cleaned;
+
+              // Delete previous screenshot message if exists
+              if (lastMessageId) {
+                try {
+                  await bot.api.deleteMessage(chatId, lastMessageId);
+                } catch {}
               }
-            }
-          }
 
-          // Build message: header + preview (or tip if no preview yet)
-          let messageText = `🧠 *Claude is writing...* (${timeStr})`;
-          if (preview) {
-            // Escape markdown special chars in preview to avoid parse errors
-            const safePreview = preview
-              .replace(/`{3,}/g, '```')  // normalize code fences
-              .slice(0, 800);  // hard limit
-            messageText += `\n\n\`\`\`\n${safePreview}\n\`\`\`\n_...writing..._`;
-          } else {
-            // No response yet, show tip
-            const tip = waitingTips[tipIndex % waitingTips.length];
-            tipIndex++;
-            messageText += `\n\n${tip}`;
-          }
-
-          try {
-            await bot.api.editMessageText(
-              chatId,
-              lastMessageId,
-              messageText,
-              {
+              // Send new screenshot
+              const photoMsg = await bot.api.sendPhoto(chatId, new InputFile(screenshotPath), {
+                caption: `🧠 *Claude is working...* (${timeStr})\n\n_Tap 🛑 to interrupt_`,
                 parse_mode: 'Markdown',
                 reply_markup: getClaudeThinkingKeyboard(),
+              });
+              lastMessageId = photoMsg.message_id;
+
+              // Cleanup temp file
+              try { await fs.promises.unlink(screenshotPath); } catch {}
+            } catch (err) {
+              // Screenshot failed, fall back to simple text
+              console.error('[AutoRefresh] Screenshot failed:', err);
+            }
+          }
+        } else {
+          // Original mode: edit text message with preview
+          if (lastMessageId && (now - lastUiUpdate) >= UI_UPDATE_INTERVAL) {
+            lastUiUpdate = now;
+            const elapsed = Math.floor((now - startTime) / 1000);
+            const mins = Math.floor(elapsed / 60);
+            const secs = elapsed % 60;
+            const timeStr = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
+
+            // Extract Claude's response preview (cleaned)
+            let preview = '';
+            if (messageToFind) {
+              const lines = currentScreen.split('\n');
+              let startIndex = 0;
+              for (let i = 0; i < lines.length; i++) {
+                if (lines[i].includes(messageToFind.slice(0, 30))) {
+                  startIndex = i + 1;
+                  break;
+                }
               }
-            );
-          } catch {
-            // Edit failed - might be markdown parse error, try plain
+              if (startIndex > 0) {
+                let responseLines = lines.slice(startIndex);
+                responseLines = responseLines.filter(line => {
+                  if (line.includes('───────')) return false;
+                  if (line.match(/^>\s*$/)) return false;
+                  if (line.includes('esc to interrupt')) return false;
+                  if (line.includes('Context left until')) return false;
+                  if (line.includes('shift+tab')) return false;
+                  if (line.includes('bypass permissions')) return false;
+                  if (line.match(/^\s*✦\s*(Thinking|Reading|Writing)/)) return false;
+                  return true;
+                });
+                const cleaned = responseLines.join('\n').trim();
+                if (cleaned.length > 30) {
+                  preview = cleaned.length > 600 ? '...' + cleaned.slice(-600) : cleaned;
+                }
+              }
+            }
+
+            let messageText = `🧠 *Claude is writing...* (${timeStr})`;
+            if (preview) {
+              const safePreview = preview.replace(/`{3,}/g, '```').slice(0, 800);
+              messageText += `\n\n\`\`\`\n${safePreview}\n\`\`\`\n_...writing..._`;
+            } else {
+              const tip = waitingTips[tipIndex % waitingTips.length];
+              tipIndex++;
+              messageText += `\n\n${tip}`;
+            }
+
             try {
-              await bot.api.editMessageText(
-                chatId,
-                lastMessageId,
-                `🧠 Claude is writing... (${timeStr})\n\n${preview || waitingTips[tipIndex % waitingTips.length]}`,
-                { reply_markup: getClaudeThinkingKeyboard() }
-              );
-            } catch {}
+              await bot.api.editMessageText(chatId, lastMessageId, messageText, {
+                parse_mode: 'Markdown',
+                reply_markup: getClaudeThinkingKeyboard(),
+              });
+            } catch {
+              try {
+                await bot.api.editMessageText(chatId, lastMessageId,
+                  `🧠 Claude is writing... (${timeStr})\n\n${preview || waitingTips[tipIndex % waitingTips.length]}`,
+                  { reply_markup: getClaudeThinkingKeyboard() }
+                );
+              } catch {}
+            }
           }
         }
         return;
@@ -470,10 +523,15 @@ async function startAutoRefresh(
         // Handle long outputs by chunking (NO truncation - send full response)
         const chunks = splitScreenContent(responseContent || '(empty)');
 
-        if (chunks.length === 1 && lastMessageId && !hasShownFirstScreen) {
-          // Short output - edit existing message
+        // In quiet mode (screenshot), always delete and send new (can't edit photo to text)
+        if (QUIET_MODE || chunks.length > 1 || hasShownFirstScreen) {
+          // Delete thinking/screenshot message first
+          if (lastMessageId) {
+            try { await bot.api.deleteMessage(chatId, lastMessageId); } catch {}
+          }
+        } else if (chunks.length === 1 && lastMessageId && !hasShownFirstScreen) {
+          // Original mode: Short output - edit existing message
           try {
-            // Get pins for quick project switcher
             const pins = getPins(userId);
             const currentProject = getCurrentProject(userId) ?? undefined;
 
@@ -489,14 +547,11 @@ async function startAutoRefresh(
             hasShownFirstScreen = true;
             return;
           } catch {
-            // Edit failed, send new message
+            // Edit failed, delete and send new
+            if (lastMessageId) {
+              try { await bot.api.deleteMessage(chatId, lastMessageId); } catch {}
+            }
           }
-        }
-
-        // Long output or edit failed - send chunks
-        // Delete thinking message first
-        if (lastMessageId) {
-          try { await bot.api.deleteMessage(chatId, lastMessageId); } catch {}
         }
 
         await bot.api.sendMessage(chatId, '✅ *Done!*', { parse_mode: 'Markdown' });
@@ -597,6 +652,15 @@ export function setupBot(
   executor: TerminalExecutor,
   notifier: CommandNotifier
 ): void {
+  // Restore tmux sessions from database on startup
+  restoreSessionsFromDatabase().then(count => {
+    if (count > 0) {
+      console.log(`[Termo] Restored ${count} active tmux session(s) from database`);
+    }
+  }).catch(err => {
+    console.error('[Termo] Failed to restore sessions:', err);
+  });
+
   // /start command
   bot.command('start', async (ctx) => {
     const userId = ctx.from!.id;

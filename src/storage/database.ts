@@ -155,6 +155,48 @@ function runMigrations(database: Database.Database): void {
       updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )
   `).run();
+
+  // Active tmux sessions - persists across bot restarts
+  database.prepare(`
+    CREATE TABLE IF NOT EXISTS active_tmux_sessions (
+      user_id INTEGER PRIMARY KEY,
+      session_name TEXT NOT NULL,
+      attached_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+  `).run();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Active Tmux Session Persistence
+// ─────────────────────────────────────────────────────────────────────────────
+
+export function saveActiveTmuxSession(userId: number, sessionName: string): void {
+  const database = getDatabase();
+  database.prepare(`
+    INSERT OR REPLACE INTO active_tmux_sessions (user_id, session_name, attached_at)
+    VALUES (?, ?, CURRENT_TIMESTAMP)
+  `).run(userId, sessionName);
+}
+
+export function clearActiveTmuxSession(userId: number): void {
+  const database = getDatabase();
+  database.prepare(`DELETE FROM active_tmux_sessions WHERE user_id = ?`).run(userId);
+}
+
+export function getActiveTmuxSession(userId: number): string | null {
+  const database = getDatabase();
+  const row = database.prepare(`
+    SELECT session_name FROM active_tmux_sessions WHERE user_id = ?
+  `).get(userId) as { session_name: string } | undefined;
+  return row?.session_name || null;
+}
+
+export function getAllActiveTmuxSessions(): Array<{ userId: number; sessionName: string }> {
+  const database = getDatabase();
+  const rows = database.prepare(`
+    SELECT user_id, session_name FROM active_tmux_sessions
+  `).all() as Array<{ user_id: number; session_name: string }>;
+  return rows.map(r => ({ userId: r.user_id, sessionName: r.session_name }));
 }
 
 export function closeDatabase(): void {
